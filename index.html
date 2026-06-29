@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>作業記録・請求管理 v3</title>
 <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI','Yu Gothic UI',sans-serif;background:#f0f0f0;color:#414141;font-size:13px}
@@ -191,6 +192,10 @@ td.r{text-align:right;font-variant-numeric:tabular-nums}
       <button class="fo-btn primary" onclick="saveCurrentFile()">💾 保存</button>
       <button class="fo-btn" onclick="saveNewFile()">別名保存</button>
       <span class="file-nm" id="file-nm">未指定</span>
+      <span style="color:#555;font-size:11px;margin:0 2px">|</span>
+      <button class="fo-btn" onclick="saveToGdrive()" title="Googleドライブに保存">☁ Drive保存</button>
+      <button class="fo-btn" onclick="loadFromGdrive()" title="Googleドライブから読込">☁ Drive読込</button>
+      <span class="file-nm" id="gdrive-hd-status"></span>
     </div>
     <div class="mn">
       <button onclick="chMonth(-1)">◀</button>
@@ -406,7 +411,7 @@ td.r{text-align:right;font-variant-numeric:tabular-nums}
       <div class="ch">デフォルト設定</div>
       <div class="cb">
         <div class="sg4" style="margin-bottom:10px">
-          <div class="fg"><label>委託先（デフォルト）</label><input type="text" id="def-client" placeholder="株式会社Things（PRISM）"></div>
+          <div class="fg"><label>委託先（デフォルト）</label><input type="text" id="def-client" placeholder="委託先会社名"></div>
           <div class="fg"><label>宛先担当者名</label><input type="text" id="def-recipient" placeholder="田中 一郎"></div>
           <div class="fg"><label>デフォルト時間単価（¥/h）</label><input type="number" id="def-rate" step="500" min="0"></div>
           <div class="fg"><label>請求書番号プレフィックス</label><input type="text" id="def-prefix" value="INV"></div>
@@ -416,6 +421,30 @@ td.r{text-align:right;font-variant-numeric:tabular-nums}
             <option value="yes">あり（10%）</option>
             <option value="no">なし（税抜のみ）</option>
           </select>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch">Google Drive 連携</div>
+      <div class="cb">
+        <div class="fg" style="max-width:560px;margin-bottom:12px">
+          <label>OAuth 2.0 クライアントID</label>
+          <input type="text" id="gdrive-client-id" placeholder="123456789-xxxxxxxxxxxx.apps.googleusercontent.com">
+        </div>
+        <div style="font-size:11px;color:#777;line-height:1.9;background:#f5f5f5;padding:10px 12px;border-radius:3px;border:1px solid #ddd;margin-bottom:12px">
+          <b style="color:#414141">初回設定手順（一度だけ）</b><br>
+          ① <a href="https://console.cloud.google.com/" target="_blank" style="color:#414141">Google Cloud Console</a> でプロジェクトを作成<br>
+          ② 「APIとサービス → ライブラリ」で <b>Google Drive API</b> を有効化<br>
+          ③ 「APIとサービス → 認証情報 → OAuth 2.0 クライアントID」を作成（種類: ウェブアプリケーション）<br>
+          ④ 「承認済みの JavaScript 生成元」にこのページの URL を追加（例: <code>http://localhost:8080</code>）<br>
+          ⑤ 発行されたクライアントIDを上欄に貼り付けて保存<br>
+          <span style="color:#c00">⚠ file:// プロトコルでは動作しません。ローカルサーバー（<code>npx serve .</code> 等）経由で開いてください。</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-mid" onclick="saveToGdrive()">☁ Driveに保存</button>
+          <button class="btn btn-ghost" onclick="loadFromGdrive()">☁ Driveから読込</button>
+          <button class="btn btn-ghost btn-sm" onclick="disconnectGdrive()">接続をリセット</button>
+          <span id="gdrive-settings-status" style="font-size:11px;color:#888;margin-left:4px"></span>
         </div>
       </div>
     </div>
@@ -466,7 +495,8 @@ function defaultData(){
     publisher:{company:'',name:'',zip:'',addr:'',addr2:'',tel:'',email:'',invoiceReg:''},
     bank:{bank:'',branch:'',type:'普通',no:'',holder:'',note:'業務委託費'},
     signatures:{author:'',reviewer:''},
-    defaults:{client:'株式会社Things（PRISM）',recipient:'',rate:0,prefix:'INV'},
+    defaults:{client:'',recipient:'',rate:0,prefix:'INV'},
+    gdriveClientId:'',
     taxEnabled:true,
     months:{},sequences:{}
   };
@@ -479,11 +509,139 @@ function loadData(){
   if(!appData.signatures) appData.signatures={author:'',reviewer:''};
   if(!appData.defaults.recipient) appData.defaults.recipient='';
   if(appData.taxEnabled===undefined) appData.taxEnabled=true;
+  if(!appData.gdriveClientId) appData.gdriveClientId='';
 }
 
 function saveData(){
   localStorage.setItem('wt3_data',JSON.stringify(appData));
   autoSaveFile();
+}
+
+// ════════ Google Drive ════════
+let gdriveToken=null, gdriveTokenExpiry=0;
+let gdriveFileId=localStorage.getItem('wt3_gdriveFileId')||null;
+let gdriveFilename=localStorage.getItem('wt3_gdriveName')||null;
+
+function gdriveReady(){return typeof google!=='undefined'&&google.accounts?.oauth2;}
+
+function updateGdriveStatus(){
+  const connected=!!(gdriveFileId&&gdriveToken&&Date.now()<gdriveTokenExpiry);
+  const txt=gdriveFileId
+    ?`☁ ${gdriveFilename||'Drive接続済'}`
+    :'☁ 未接続';
+  const col=gdriveFileId?'#4a8':'#888';
+  ['gdrive-hd-status','gdrive-settings-status'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el){el.textContent=txt;el.style.color=col;}
+  });
+}
+
+function requestGdriveToken(){
+  return new Promise((resolve,reject)=>{
+    if(!gdriveReady()){reject('Google認証ライブラリが読み込まれていません。\nhttp://またはhttps://で開いてください（file://不可）');return;}
+    const cid=appData.gdriveClientId||document.getElementById('gdrive-client-id')?.value.trim();
+    if(!cid){reject('設定タブでGoogle OAuth クライアントIDを入力・保存してください');return;}
+    google.accounts.oauth2.initTokenClient({
+      client_id:cid,
+      scope:'https://www.googleapis.com/auth/drive.file',
+      callback:resp=>{
+        if(resp.error){reject(`認証エラー: ${resp.error_description||resp.error}`);return;}
+        gdriveToken=resp.access_token;
+        gdriveTokenExpiry=Date.now()+(parseInt(resp.expires_in)||3600)*1000-60000;
+        resolve(resp.access_token);
+      }
+    }).requestAccessToken();
+  });
+}
+
+async function getGdriveToken(){
+  if(gdriveToken&&Date.now()<gdriveTokenExpiry) return gdriveToken;
+  return requestGdriveToken();
+}
+
+async function saveToGdrive(){
+  try{
+    toast('☁ Drive認証中...');
+    const token=await getGdriveToken();
+    const content=JSON.stringify(appData,null,2);
+    const fname=`wt_data.json`;
+    let res;
+    if(gdriveFileId){
+      res=await fetch(`https://www.googleapis.com/upload/drive/v3/files/${gdriveFileId}?uploadType=media`,{
+        method:'PATCH',
+        headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+        body:content
+      });
+    } else {
+      const boundary='wt3bnd'+Date.now();
+      const meta=JSON.stringify({name:fname,mimeType:'application/json'});
+      const body=`--${boundary}\r\nContent-Type: application/json\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${content}\r\n--${boundary}--`;
+      res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{
+        method:'POST',
+        headers:{Authorization:`Bearer ${token}`,'Content-Type':`multipart/related; boundary=${boundary}`},
+        body
+      });
+    }
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${res.status}`);}
+    const data=await res.json();
+    if(!gdriveFileId){
+      gdriveFileId=data.id; gdriveFilename=data.name;
+      localStorage.setItem('wt3_gdriveFileId',gdriveFileId);
+      localStorage.setItem('wt3_gdriveName',gdriveFilename);
+    }
+    updateGdriveStatus();
+    toast('✅ Googleドライブに保存しました');
+  }catch(e){toast('Drive保存エラー: '+e.message||e);}
+}
+
+async function loadFromGdrive(){
+  try{
+    toast('☁ Drive認証中...');
+    const token=await getGdriveToken();
+    let fid=gdriveFileId;
+    if(!fid){
+      toast('☁ Driveからファイル一覧を取得中...');
+      const q=encodeURIComponent("name='wt_data.json' and mimeType='application/json' and trashed=false");
+      const res=await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc`,{
+        headers:{Authorization:`Bearer ${token}`}
+      });
+      if(!res.ok) throw new Error(`ファイル一覧取得失敗 HTTP ${res.status}`);
+      const list=await res.json();
+      if(!list.files?.length){
+        toast('DriveにwT_data.jsonが見つかりません。先に「Drive保存」してください');return;
+      }
+      fid=list.files[0].id;
+      gdriveFilename=list.files[0].name;
+    }
+    const res=await fetch(`https://www.googleapis.com/drive/v3/files/${fid}?alt=media`,{
+      headers:{Authorization:`Bearer ${token}`}
+    });
+    if(!res.ok) throw new Error(`ファイル取得失敗 HTTP ${res.status}`);
+    const d=await res.json();
+    if(!d.version||!d.months) throw new Error('データ形式が正しくありません');
+    appData=d;
+    if(!appData.signatures) appData.signatures={author:'',reviewer:''};
+    if(!appData.defaults.recipient) appData.defaults.recipient='';
+    if(appData.taxEnabled===undefined) appData.taxEnabled=true;
+    if(!appData.gdriveClientId) appData.gdriveClientId='';
+    gdriveFileId=fid;
+    localStorage.setItem('wt3_data',JSON.stringify(appData));
+    localStorage.setItem('wt3_gdriveFileId',gdriveFileId);
+    localStorage.setItem('wt3_gdriveName',gdriveFilename||'wt_data.json');
+    updateGdriveStatus();
+    if(currentTab==='settings') loadSettingsUI();
+    render();
+    toast('✅ Googleドライブから読み込みました');
+  }catch(e){toast('Drive読込エラー: '+(e.message||e));}
+}
+
+function disconnectGdrive(){
+  if(!confirm('Drive接続情報をリセットしますか？（データは削除されません）'))return;
+  gdriveToken=null; gdriveTokenExpiry=0; gdriveFileId=null; gdriveFilename=null;
+  localStorage.removeItem('wt3_gdriveFileId');
+  localStorage.removeItem('wt3_gdriveName');
+  updateGdriveStatus();
+  toast('Drive接続をリセットしました');
 }
 
 function ensureMonth(){
@@ -694,6 +852,8 @@ function loadSettingsUI(){
   document.getElementById('def-rate').value=d.rate||'';
   document.getElementById('def-prefix').value=d.prefix||'INV';
   document.getElementById('def-tax').value=appData.taxEnabled!==false?'yes':'no';
+  document.getElementById('gdrive-client-id').value=appData.gdriveClientId||'';
+  updateGdriveStatus();
 }
 
 function saveSettings(){
@@ -702,6 +862,7 @@ function saveSettings(){
   appData.bank={bank:document.getElementById('bk-bank').value.trim(),branch:document.getElementById('bk-branch').value.trim(),type:document.getElementById('bk-type').value,no:document.getElementById('bk-no').value.trim(),holder:document.getElementById('bk-holder').value.trim(),note:document.getElementById('bk-note').value.trim()};
   appData.defaults={client:document.getElementById('def-client').value.trim(),recipient:document.getElementById('def-recipient').value.trim(),rate:Number(document.getElementById('def-rate').value)||0,prefix:document.getElementById('def-prefix').value.trim()||'INV'};
   appData.taxEnabled=document.getElementById('def-tax').value!=='no';
+  appData.gdriveClientId=document.getElementById('gdrive-client-id').value.trim();
   saveData(); toast('設定を保存しました'); renderSummary();
 }
 
@@ -1171,6 +1332,7 @@ window.addEventListener('load',()=>{
     document.getElementById('es-date').value=ds;
   }
   render();
+  updateGdriveStatus();
 });
 
 document.addEventListener('keydown',e=>{
